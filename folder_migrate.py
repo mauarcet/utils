@@ -7,7 +7,7 @@ import argparse
 class FolderMigrate:
     """
     Migrate local folders to a remote server.
-    
+
     local_addr: str – local directory path.
     remote_addr: str – remote destination in the format user@host:/path/to/dir.
     password: Optional SSH password for non-interactive authentication.
@@ -19,7 +19,7 @@ class FolderMigrate:
 
         folders_to_migrate = self.compare()
         if not folders_to_migrate:
-            print("[*] All local folders already exist on the remote server.")
+            print("[*] No folders require migration (after applying exclusions).")
             return
 
         print(f"[*] Folders to migrate: {folders_to_migrate}")
@@ -36,8 +36,10 @@ class FolderMigrate:
     def get_folders(self, work_dir: str) -> [str]:
         """
         Return a list of folder names in the given directory.
-        If work_dir is remote (format: user@host:/path), use SSH (with sshpass if password is provided).
+        Skips folders starting with a dot.
+        If work_dir is remote (format: user@host:/path), uses SSH (with sshpass if password is provided).
         """
+        folders = []
         if "@" in work_dir and ":" in work_dir:
             userhost, remote_path = work_dir.split(":", 1)
             cmd = (
@@ -53,34 +55,69 @@ class FolderMigrate:
             )
             if result.returncode != 0:
                 print(f"Error listing remote directory: {result.stderr.strip()}")
-                return []
-            folders = []
+                return folders
             for line in result.stdout.strip().splitlines():
                 folder_name = os.path.basename(os.path.normpath(line))
+                if folder_name.startswith('.'):
+                    continue
                 folders.append(folder_name)
             return folders
         else:
             try:
-                items = os.listdir(work_dir)
-                return [item for item in items if os.path.isdir(os.path.join(work_dir, item))]
+                for item in os.listdir(work_dir):
+                    if item.startswith('.'):
+                        continue
+                    if os.path.isdir(os.path.join(work_dir, item)):
+                        folders.append(item)
+                return folders
             except Exception as e:
                 print(f"Error accessing directory {work_dir}: {e}")
                 return []
 
+    def get_migration_plan_for_folder(self, folder: str) -> list:
+        """
+        Run rsync in dry-run mode to determine what would be migrated for the given folder.
+        Returns a list of items that rsync would transfer.
+        Uses an exclude pattern that skips directories starting with a dot but not dotfiles.
+        """
+        local_path = os.path.join(self.local_addr, folder)
+        # Note: --exclude=.*/ (without extra quotes) excludes directories starting with a dot.
+        cmd = (
+            ["sshpass", "-p", self.password, "rsync", "-av", "--exclude=.*/", "--dry-run", local_path, self.remote_addr]
+            if self.password
+            else ["rsync", "-av", "--exclude=.*/", "--dry-run", local_path, self.remote_addr]
+        )
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if result.returncode != 0:
+            print(f"Error during dry-run for folder {folder}: {result.stderr.strip()}")
+            return []
+        # Filter out header/footer lines; assume lines listing files indicate transfers.
+        lines = result.stdout.splitlines()
+        plan = [line.strip() for line in lines if line.strip() and not line.startswith("sending incremental file list")]
+        return plan
+
     def compare(self):
         """
         Compare folders in local and remote directories.
-        Returns a list of folder names that are present locally but missing remotely.
-        If all folders exist remotely, returns None.
+        For each local folder missing on remote, run an rsync dry-run to see if there is any
+        content (excluding directories starting with a dot) to transfer.
+        Returns a list of folder names that actually have migratable content.
         """
         local_folders = self.get_folders(self.local_addr)
         remote_folders = self.get_folders(self.remote_addr)
-        missing_folders = [folder for folder in local_folders if folder not in remote_folders]
-        return missing_folders if missing_folders else None
+        folders_to_migrate = []
+        for folder in local_folders:
+            if folder in remote_folders:
+                continue
+            plan = self.get_migration_plan_for_folder(folder)
+            if plan:  # Only include if there's something to transfer
+                folders_to_migrate.append(folder)
+        return folders_to_migrate if folders_to_migrate else None
 
     def migrate(self, folders_to_migrate: [str]) -> bool:
         """
-        Secure copy (scp) the missing folders to the remote server.
+        Use rsync to securely copy folders to the remote server,
+        excluding directories starting with a dot while transferring dotfiles.
         Returns True if all migrations succeed; otherwise, False.
         """
         success = True
@@ -88,9 +125,9 @@ class FolderMigrate:
             local_path = os.path.join(self.local_addr, folder)
             print(f"[*] Migrating folder: {folder}...")
             cmd = (
-                ["sshpass", "-p", self.password, "scp", "-r", local_path, self.remote_addr]
+                ["sshpass", "-p", self.password, "rsync", "-av", "--exclude=.*/", local_path, self.remote_addr]
                 if self.password
-                else ["scp", "-r", local_path, self.remote_addr]
+                else ["rsync", "-av", "--exclude=.*/", local_path, self.remote_addr]
             )
             result = subprocess.run(cmd)
             if result.returncode != 0:
